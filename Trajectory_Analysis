@@ -1,0 +1,226 @@
+# Trajectory Analysis
+library(Seurat)
+library(monocle3)
+library(dplyr)
+library(ggplot2)
+library(patchwork)
+
+#' Helper Function: Identify Root Node based on Naive Marker 
+
+get_earliest_principal_node <- function(cds, marker_gene = "SELL") {
+  marker_expression <- exprs(cds)[rowData(cds)$gene_short_name == marker_gene, ]
+  root_cell <- names(which.max(marker_expression))
+  closest_vertex <- cds@principal_graph_aux[["UMAP"]]$pr_graph_cell_proj_closest_vertex
+  root_node <- closest_vertex[root_cell, ]
+  return(paste0("Y_", root_node))
+}
+
+# Seurat Subsetting & Monocle3 CDS Conversion
+#Load Integrated Seurat Object
+seurat_obj <- integrated_object_clean_resumed
+DefaultAssay(seurat_obj) <- "RNA"
+
+# Define T-cell cluster IDs and subset
+t_cell_clusters <- c("0", "9", "22", "15", "12", "1", "6")
+t_cell_seurat <- subset(seurat_obj, subset = seurat_clusters %in% t_cell_clusters)
+
+# Standard preprocessing on T-cell subset
+t_cell_seurat <- NormalizeData(t_cell_seurat) %>%
+  FindVariableFeatures(selection.method = "vst", nfeatures = 2000) %>%
+  ScaleData() %>%
+  RunPCA(npcs = 30, verbose = FALSE) %>%
+  RunUMAP(dims = 1:30, verbose = FALSE)
+
+# Extract counts and metadat
+t_cell_seurat <- JoinLayers(t_cell_seurat)
+expr_matrix <- LayerData(t_cell_seurat, assay = "RNA", layer = "data")
+cell_meta   <- t_cell_seurat@meta.data[colnames(expr_matrix), , drop = FALSE]
+gene_meta   <- data.frame(
+  gene_short_name = rownames(expr_matrix), 
+  row.names = rownames(expr_matrix)
+)
+
+# Construct Monocle 3 Cell Data Set (CDS)
+t_cell_cds <- new_cell_data_set(
+  expression_data = expr_matrix,
+  cell_metadata   = cell_meta,
+  gene_metadata   = gene_meta
+)
+
+# Transfer Seurat PCA & UMAP embeddings directly to CDS
+cds_barcodes <- colnames(t_cell_cds)
+reducedDims(t_cell_cds)$PCA  <- as.matrix(t_cell_seurat@reductions$pca@cell.embeddings)[cds_barcodes, ]
+reducedDims(t_cell_cds)$UMAP <- as.matrix(t_cell_seurat@reductions$umap@cell.embeddings)[cds_barcodes, ]
+
+# Clustering, Graph Learning & Rooting
+# Cluster cells with higher k to force mainland connectivity
+t_cell_cds <- cluster_cells(t_cell_cds, k = 50)
+
+# Filter for main mainland partition (Partition 1)
+t_cell_cds <- t_cell_cds[, partitions(t_cell_cds) == "1"]
+
+# Learn trajectory principal graph
+t_cell_cds <- learn_graph(t_cell_cds)
+
+# Root trajectory at peak Naive marker expression 
+root_node <- get_earliest_principal_node(t_cell_cds, marker_gene = "SELL")
+t_cell_cds <- order_cells(t_cell_cds, root_pr_nodes = root_node)
+
+
+#Trajectory & BTN3A Expression Visualization
+
+# Plot Trajectory Colored by Pseudotime
+p_trajectory <- plot_cells(
+  t_cell_cds,
+  color_cells_by = "pseudotime",
+  label_cell_groups = FALSE,
+  label_leaves = TRUE,
+  label_branch_points = TRUE,
+  graph_label_size = 3.5,
+  cell_size = 0.5,
+  trajectory_graph_segment_size = 0.75
+) + ggtitle("T-Cell Lineage Trajectory (Pseudotime)")
+
+# Spatial & Kinetic Dynamics of BTN3A Family
+btn_genes <- c("BTN3A1", "BTN3A2", "BTN3A3")
+
+p_spatial <- plot_cells(
+  t_cell_cds,
+  genes = btn_genes,
+  label_cell_groups = FALSE,
+  label_leaves = FALSE,
+  label_branch_points = FALSE,
+  cell_size = 0.4,
+  min_expr = 0.05
+) + ggtitle("BTN3A Spatial Expression")
+
+p_kinetics <- plot_genes_in_pseudotime(
+  t_cell_cds[rowData(t_cell_cds)$gene_short_name %in% btn_genes, ],
+  color_cells_by = "pseudotime",
+  min_expr = 0.1,
+  ncol = 1,
+  trend_formula = "~ splines::ns(pseudotime, df=3)"
+) + theme_classic() + ggtitle("BTN3A Expression Kinetics")
+
+# Combine Spatial and Kinetic plots side-by-side
+p_combined <- p_spatial | p_kinetics
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+# TCell_Trajectory_Phases
+library(monocle3)
+library(dplyr)
+library(ggplot2)
+library(patchwork)
+library(Matrix)
+
+# Define custom color palette for trajectory phases
+phase_colors <- c(
+  "Early" = "#3B9AB2",  # Ocean Blue
+  "Mid"   = "#E1AF00",  # Golden Yellow
+  "Late"  = "#F21A00"   # Fire Red
+)
+
+# Load trajectory object if running as an independent script
+if (!exists("t_cell_cds")) {
+  t_cell_cds <- readRDS("results/T_cell_trajectory_final.rds")
+}
+
+
+#  Trajectory Rooting & Phase Segmentation
+# Assign trajectory root based on peak SELL expression (if not already set)
+if (is.null(pseudotime(t_cell_cds, fallback_to_wall = FALSE))) {
+  sell_row  <- row.names(rowData(t_cell_cds))[rowData(t_cell_cds)$gene_short_name == "SELL"]
+  max_cell  <- names(which.max(counts(t_cell_cds)[sell_row, ]))
+  root_node <- as.character(t_cell_cds@principal_graph_aux[["UMAP"]]$pr_graph_cell_proj_closest_vertex[max_cell, ])
+  t_cell_cds <- order_cells(t_cell_cds, root_pr_nodes = root_node)
+}
+
+# Divide trajectory into 3 equal pseudotime segments
+t_cell_cds$trajectory_phase <- cut(
+  pseudotime(t_cell_cds),
+  breaks = 3,
+  labels = c("Early", "Mid", "Late")
+)
+
+# Phase Visualizations (Trajectory, Kinetics & Violin Distributions)
+
+# Trajectory Map Colored by Phase
+p_phase_map <- plot_cells(
+  t_cell_cds,
+  color_cells_by = "trajectory_phase",
+  label_groups_by_cluster = FALSE,
+  label_leaves = FALSE,
+  label_branch_points = FALSE,
+  label_principal_points = FALSE,
+  cell_size = 0.8
+) +
+  scale_color_manual(values = phase_colors) +
+  theme_classic() +
+  ggtitle("T-Cell Trajectory: Early, Mid, and Late Phases")
+
+# BTN3A Pseudotime Kinetics Colored by Phase
+p_phase_kinetics <- plot_genes_in_pseudotime(
+  t_cell_cds[rowData(t_cell_cds)$gene_short_name == "BTN3A2", ],
+  color_cells_by = "trajectory_phase",
+  min_expr = 0.1,
+  cell_size = 0.5
+) +
+  scale_color_manual(values = phase_colors) +
+  theme_classic() +
+  ggtitle("BTN3A2 Pseudotime Kinetics Across Phases")
+
+
+
+# Phase-Specific Co-Expression Analysis (Spearman Correlation)
+
+#' Function to calculate Spearman correlation partners for a target gene in a given phase
+find_partners_by_phase <- function(cds_obj, phase_name, target_gene = "BTN3A3", top_n = 30) {
+  # Subset CDS to the target phase
+  cds_subset <- cds_obj[, colData(cds_obj)$trajectory_phase == phase_name]
+  expr_mat   <- normalized_counts(cds_subset)
+
+  if (!(target_gene %in% rownames(expr_mat))) {
+    message(paste(target_gene, "not found in phase:", phase_name))
+    return(NULL)
+  }
+
+  target_vec <- as.numeric(expr_mat[target_gene, ])
+
+  # Calculate Spearman correlation across all expressed genes
+  cor_vals <- apply(expr_mat, 1, function(x) {
+    if (sum(x) == 0) return(0)
+    cor(as.numeric(x), target_vec, method = "spearman")
+  })
+
+  # Rank top partners
+  partner_df <- data.frame(
+    gene_short_name = names(cor_vals),
+    correlation     = cor_vals,
+    phase           = phase_name
+  ) %>%
+    filter(gene_short_name != target_gene) %>%
+    filter(!is.na(correlation)) %>%
+    arrange(desc(correlation)) %>%
+    head(top_n)
+
+  return(partner_df)
+}
+
+# Run Spearman co-expression analysis for each phase
+early_partners <- find_partners_by_phase(t_cell_cds, "Early", target_gene = "BTN3A3")
+mid_partners   <- find_partners_by_phase(t_cell_cds, "Mid",   target_gene = "BTN3A3")
+late_partners  <- find_partners_by_phase(t_cell_cds, "Late",  target_gene = "BTN3A3")
+
+# Combine results into a consolidated data frame
+all_phase_partners <- rbind(early_partners, mid_partners, late_partners)
+
+
+# 5. Phase-Specific Mean Expression Matrix
+# Calculate mean expression per phase for BTN3A family members
+btn_genes <- c("BTN3A1", "BTN3A2", "BTN3A3")
+cell_meta <- as.data.frame(colData(t_cell_cds))
+expr_mat  <- normalized_counts(t_cell_cds[btn_genes, ])
+
+phase_means <- sapply(c("Early", "Mid", "Late"), function(p) {
+  cells_in_phase <- rownames(cell_meta[cell_meta$trajectory_phase == p, ])
+  Matrix::rowMeans(expr_mat[, cells_in_phase, drop = FALSE])
