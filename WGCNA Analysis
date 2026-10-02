@@ -1,0 +1,95 @@
+#WGCNA Analysis:
+library(Seurat)
+library(hdWGCNA)
+library(tidyverse)
+library(igraph)
+
+# Load final integrated Seurat object
+seurat_obj <- readRDS("harmony_integrated_object_final_with_clusters_clean.rds")
+
+
+# Gene List Setup & WGCNA Initialization
+# Define 12 RF Regulators and 3 BTN family target genes
+target_genes <- c(
+  "BTN3A1", "BTN3A2", "BTN3A3", 
+  "B2M", "CCL5", "TXNIP", "PIK3R1", "GZMH", "TMEM88", 
+  "GZMK", "CAVIN2", "TRAT1", "GIMAP7", "SLA", "GBP5"
+)
+
+# Combine highly variable features with target genes to guarantee inclusion
+final_gene_selection <- unique(c(VariableFeatures(seurat_obj), target_genes))
+
+# Setup fresh WGCNA experiment
+seurat_obj <- SetupForWGCNA(
+  seurat_obj,
+  gene_select = "custom",
+  features = final_gene_selection,
+  wgcna_name = "BTN_Validation_Final"
+)
+
+
+# Metacell Construction & Normalization
+# Construct metacells grouped by seurat_clusters
+seurat_obj <- MetacellsByGroups(
+  seurat_obj,
+  group.by = "seurat_clusters",
+  k = 25,
+  ident.group = "seurat_clusters"
+)
+
+# Normalize metacells
+seurat_obj <- NormalizeMetacells(seurat_obj)
+
+# Add 'all' grouping column to metacell metadata to prevent slot mismatch
+m_obj <- GetMetacellObject(seurat_obj)
+m_obj$all <- "all_cells"
+seurat_obj <- SetMetacellObject(seurat_obj, m_obj)
+
+
+# Expression Setup & Soft Power Selection
+# Set DatExpr using metacells
+seurat_obj <- SetDatExpr(
+  seurat_obj,
+  group_name = "all_cells",
+  group.by = "all",
+  assay = "SCT",
+  layer = "data",
+  use_metacells = TRUE
+)
+
+# Optional: Test soft-thresholding powers
+seurat_obj <- TestSoftPowers(
+  seurat_obj,
+  networkType = 'signed'
+)
+PlotSoftPowers(seurat_obj)
+
+
+#Network Construction
+# Construct network using soft_power = 9
+seurat_obj <- ConstructNetwork(
+  seurat_obj,
+  soft_power = 9,
+  setDatExpr = FALSE,
+  overwrite_tom = TRUE
+)
+
+# Extract Topological Overlap Matrix (TOM) & Calculate Connectivity (kIN)
+# Extract TOM matrix
+tom_mat <- GetTOM(seurat_obj)
+
+# Intersect target list with TOM matrix rownames to safely subset
+existing_genes <- intersect(target_genes, rownames(tom_mat))
+subset_tom <- tom_mat[existing_genes, existing_genes]
+
+# Calculate Intra-modular Connectivity (kIN)
+kin_scores <- data.frame(
+  Gene = existing_genes,
+  Connectivity = rowSums(subset_tom) - 1
+) %>% arrange(desc(Connectivity))
+
+#  Output & Export Results
+print(kin_scores)
+
+# Save master regulator connectivity table
+write.csv(kin_scores, "Final_WGCNA_BTN_Connectivity.csv", row.names = FALSE)
