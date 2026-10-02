@@ -1,0 +1,173 @@
+# percentage of BTN3A
+library(Seurat)
+library(dplyr)
+library(readr)
+# Define the gene of interest and the assay to use
+gene_name <- "BTN3A2"
+assay_name <- "SCT"
+
+# Calculate the expression summary table
+expression_data <- GetAssayData(
+  object = integrated_object_clean_resumed,
+  assay = assay_name,
+  layer = "data"
+)[gene_name, ]
+
+cluster_data <- integrated_object_clean_resumed@meta.data %>%
+  dplyr::select(seurat_clusters)
+
+expression_summary <- cluster_data %>%
+  mutate(BTN3A2_Expression = expression_data[rownames(cluster_data)]) %>%
+  mutate(is_expressed = BTN3A2_Expression > 0) %>%
+  group_by(seurat_clusters) %>%
+  summarise(
+    Total_Cells = n(),
+    Cells_Expressing_BTN3A2 = sum(is_expressed),
+    Percentage_Expressing = (Cells_Expressing_BTN3A2 / Total_Cells) * 100
+  ) %>%
+  arrange(desc(Percentage_Expressing))
+
+#  Save the table to a CSV file 
+readr::write_csv(expression_summary, "BTN3A2_Expression_Per_Cluster_Summary.csv")
+
+print("The table has been saved to BTN3A2_Expression_Per_Cluster_Summary.csv in your working directory.")
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+# Overall DEGs
+library(Seurat)
+library(readr)
+library(dplyr)
+library(tibble)
+
+# Set the default assay to "RNA"
+DefaultAssay(integrated_object_clean_resumed) <- "RNA"
+print("Default assay set to 'RNA'.")
+
+# Re-normalize the RNA assay (to ensure the 'data' layer is populated, as previously advised)
+integrated_object_clean_resumed <- NormalizeData(integrated_object_clean_resumed)
+print("RNA assay normalized.")
+
+#  CRITICAL FIX: Join Layers 
+# This resolves the "data layers are not joined" error.
+integrated_object_clean_resumed <- JoinLayers(integrated_object_clean_resumed)
+print("RNA layers joined successfully.")
+
+# Prepare the object (ensure factor levels are correct)
+integrated_object_clean_resumed@meta.data$group <- factor(
+  integrated_object_clean_resumed@meta.data$group,
+  levels = c("Normal", "Tumor")
+)
+
+#  Run FindMarkers()
+print("Running FindMarkers() on the joined RNA assay...")
+
+deg_overall_tumor_vs_normal <- FindMarkers(
+  object = integrated_object_clean_resumed,
+  ident.1 = "Tumor",
+  ident.2 = "Normal",
+  group.by = "group",
+  min.pct = 0.1,
+  logfc.threshold = 0.25,
+  test.use = "wilcox"
+)
+
+# Check BTN3A3 and save the results
+btn3a1_overall_result <- deg_overall_tumor_vs_normal["BTN3A1", ]
+
+readr::write_csv(
+  deg_overall_tumor_vs_normal %>% tibble::rownames_to_column("gene"),
+  "DEG_Overall_Tumor_vs_Normal_RNAAssay_Joined.csv"
+)
+
+print("--- Overall Differential Expression Complete ---")
+print(btn3a1_overall_result)
+print(paste("Full DEG table saved to:", "DEG_Overall_Tumor_vs_Normal_RNAAssay_Joined.csv"))
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+#Celltype specific DEG
+library(Seurat)
+library(dplyr)
+library(readr)
+library(tibble)
+library(future)
+library(metap)
+library(multtest)
+
+# Ensure output directory exists
+if (!dir.exists("./results")) dir.create("./results", recursive = TRUE)
+
+
+# DEG for T cell type
+# Define the T-cell clusters
+tcell_clusters <- c("0", "1", "9", "12", "15", "22")
+
+# Ensure the cluster column is character/factor
+integrated_object_clean_resumed@meta.data$seurat_clusters <- 
+  as.character(integrated_object_clean_resumed@meta.data$seurat_clusters)
+
+#  Subset the object to contain ONLY T-cells
+tcell_object <- subset(
+  integrated_object_clean_resumed,
+  subset = seurat_clusters %in% tcell_clusters
+)
+
+print(paste("Subset object contains", ncol(tcell_object), "T-cells."))
+
+# Ensure the 'group' column is correctly set as a factor for comparison
+tcell_object@meta.data$group <- factor(
+  tcell_object@meta.data$group,
+  levels = c("Normal", "Tumor")
+)
+
+# Ensure the RNA assay is the default for the subset
+DefaultAssay(tcell_object) <- "RNA"
+
+# Prep RNA assay layers and normalize
+tcell_object <- JoinLayers(tcell_object)
+tcell_object <- NormalizeData(tcell_object)
+
+# Verify group cell counts
+print(table(tcell_object$group))
+
+# Run FindMarkers (Filtered)
+deg_tcells_tumor_vs_normal <- FindMarkers(
+  object = tcell_object,
+  ident.1 = "Tumor",
+  ident.2 = "Normal",
+  group.by = "group",
+  assay = "RNA",
+  test.use = "wilcox",
+  min.pct = 0.0,      # Recommended: don't use 0.0 to speed up computation
+  logfc.threshold = 0.0 # Recommended: default is usually 0.25
+)
+
+# Check BTN3A3 and save filtered results
+btn3a3_tcell_result <- deg_tcells_tumor_vs_normal["BTN3A3", ]
+
+readr::write_csv(
+  deg_tcells_tumor_vs_normal %>% tibble::rownames_to_column("gene"),
+  "./results/DEG_naiveT_Cells_Tumor_vs_Normal.csv"
+)
+
+print("--- Differential Expression Result for BTN3A3 (T-Cells Only) ---")
+print(btn3a3_tcell_result)
+print(paste("Full T-Cell DEG table saved to:", "./results/DEG_naiveT_Cells_Tumor_vs_Normal.csv"))
+
+# Run FindMarkers (Unfiltered)
+deg_tcells_unfiltered <- FindMarkers(
+  object = tcell_object,
+  group.by = "group",
+  min.pct = 0.0,        # Set to 0 to include all detected genes
+  logfc.threshold = 0.0, # Set to 0 to include all genes, regardless of fold change
+  test.use = "wilcox"
+)
+
+readr::write_csv(
+  deg_tcells_unfiltered %>% tibble::rownames_to_column("gene"),
+  "./results/DEG_TCells_Tumor_vs_Normal_unfiltered.csv"
+)
+
+# Manually check the result for BTN3A3
+btn3a3_unfiltered_result <- deg_tcells_unfiltered["BTN3A3", ]
+
+print("--- BTN3A3 T-Cell Result (Unfiltered) ---")
+print(btn3a3_unfiltered_result)
+
