@@ -1,0 +1,135 @@
+#SCENIC Analysis
+library(SCENIC)
+library(AUCell)
+library(RcisTarget)
+library(GENIE3)
+library(Seurat)
+library(Matrix)
+library(doRNG)
+library(doParallel)
+library(foreach)
+library(reshape2)
+
+# Load single-cell Seurat object
+seurat_obj <- readRDS("harmony_integrated_object_final_with_clusters_clean.rds")
+
+# Set paths to RcisTarget feather databases
+dbDir <- "~/scenic_databases"
+dbs   <- c(
+  "10kb"  = "hg38__refseq-r80__10kb_up_and_down_tss.mc9nr.feather",
+  "500bp" = "hg38__refseq-r80__500bp_up_and_100bp_down_tss.mc9nr.feather"
+)
+
+# Load human motif annotations (v9 compatible with mc9nr)
+data("motifAnnotations_hgnc_v9", package = "RcisTarget")
+motifAnnotations_hgnc <- motifAnnotations_hgnc_v9
+
+# Initialize SCENIC pipeline configuration
+scenicOptions <- initializeScenic(
+  org          = "hgnc",
+  dbDir        = dbDir,
+  dbs          = dbs,
+  datasetTitle = "BTN3A_Tumor_Analysis",
+  nCores       = 8
+)
+
+# Data Extraction & Gene/Cell Filtering
+# Join RNA layers (ensures compatibility with Seurat v5)
+seurat_obj[["RNA"]] <- JoinLayers(seurat_obj[["RNA"]])
+exprMat            <- GetAssayData(seurat_obj, assay = "RNA", layer = "counts")
+
+# Define target gene panel (3 BTN family + 12 RF regulators)
+my_genes <- c(
+  "BTN3A1", "BTN3A2", "BTN3A3", "B2M", "CCL5", "TXNIP",
+  "PIK3R1", "GZMH", "TMEM88", "GZMK", "CAVIN2",
+  "TRAT1", "GIMAP7", "SLA", "GBP5"
+)
+
+# Filter low-expression genes (must be expressed in >= 1% of total cells)
+min_cells         <- round(0.01 * ncol(exprMat))
+genes_to_keep_idx <- which(Matrix::rowSums(exprMat > 0) >= min_cells)
+exprMat_filtered  <- exprMat[genes_to_keep_idx, ]
+
+# Extract candidate TFs from human motif annotations
+all_tfs <- unique(motifAnnotations_hgnc_v9$TF)
+
+# Intersect candidate TFs and target panel with filtered dataset
+focused_genes <- intersect(unique(c(all_tfs, my_genes)), rownames(exprMat_filtered))
+
+# Subsample 30,000 cells for high statistical power
+set.seed(123)
+sub_cells_30k      <- sample(colnames(exprMat_filtered), 30000)
+exprMat_subset_30k <- exprMat_filtered[focused_genes, sub_cells_30k]
+
+# Correlation Matrix Calculation
+# Subsample a 5,000 cell chunk for fast Pearson correlation matrix calculation
+set.seed(123)
+corr_cells         <- sample(colnames(exprMat_subset_30k), 5000)
+exprMat_corr_chunk <- as.matrix(exprMat_subset_30k[, corr_cells])
+
+# Calculate Pearson correlation matrix
+corrMat <- cor(t(exprMat_corr_chunk), method = "pearson")
+
+# Save correlation matrix to SCENIC internal directory
+if (!dir.exists("int")) dir.create("int")
+saveRDS(corrMat, file = "int/1.2_corrMat.Rds")
+
+
+# Targeted GENIE3 Network Inference
+# Identify present targets and candidate TF regulators in expression matrix
+present_genes <- my_genes[my_genes %in% rownames(exprMat_subset_30k)]
+inputTFs      <- intersect(all_tfs, rownames(exprMat_subset_30k))
+
+# Run targeted GENIE3 across 8 cores
+weightMat <- GENIE3::GENIE3(
+  as.matrix(exprMat_subset_30k),
+  regulators = inputTFs,
+  targets    = present_genes,
+  nCores     = 8
+)
+
+# Convert weight matrix to long-format link list and filter out zero weights
+linkList           <- reshape2::melt(weightMat)
+colnames(linkList) <- c("TF", "Target", "weight")
+linkList           <- linkList[linkList$weight > 0, ]
+
+# Save link list for downstream SCENIC modules
+saveRDS(linkList, file = "int/1.4_GENIE3_linkList.Rds")
+
+
+# Co-expression Module Generation & Database Filtering
+# Generate TF co-expression modules
+scenicOptions@settings$dbs <- dbs
+runSCENIC_1_coexNetwork2modules(scenicOptions)
+
+# Import database rankings to cross-reference valid genes
+scenic_db       <- importRankings(file.path(dbDir, "hg38__refseq-r80__10kb_up_and_down_tss.mc9nr.feather"))
+genesInDatabase <- colnames(getRanking(scenic_db))
+
+# Filter out genes missing from hg38 motif database (e.g., CAVIN2) to prevent empty module crashes
+tfModules          <- readRDS("int/1.6_tfModules_asDF.Rds")
+tfModules_filtered <- tfModules[tfModules$Target %in% genesInDatabase, ]
+saveRDS(tfModules_filtered, file = "int/1.6_tfModules_asDF.Rds")
+
+
+# Motif Enrichment Analysis (cisTarget) & Export Results
+# Convert module dataframe into list format split by TF
+genesList <- split(tfModules_filtered$Target, tfModules_filtered$TF)
+
+# Import ranking feather object for RcisTarget enrichment
+rankings <- importRankings(file.path(dbDir, "hg38__refseq-r80__10kb_up_and_down_tss.mc9nr.feather"))
+
+# Execute cisTarget motif enrichment search
+motifEnrichment_selfMotifs <- cisTarget(
+  genesList,
+  rankings,
+  nCores = 8
+)
+
+# Save raw enrichment object
+saveRDS(motifEnrichment_selfMotifs, file = "int/2.1_motifEnrichment_selfMotifs.Rds")
+
+# Format enriched TF-target motifs and export CSV table
+results_table <- addLogo(motifEnrichment_selfMotifs)
+write.csv(results_table, file = "BTN3A_TF_Enrichment_Results.csv", row.names = FALSE)
+
