@@ -1,0 +1,363 @@
+# Single cell integrated Object:
+library(Seurat)
+library(dplyr)
+library(ggplot2)
+library(glmGamPoi)
+library(harmony)
+library(Matrix)
+
+
+# Relative paths for repository portability
+DATA_DIR   <- "./data/"
+OUTPUT_DIR <- "./results/"
+if (!dir.exists(OUTPUT_DIR)) dir.create(OUTPUT_DIR, recursive = TRUE)
+
+# Metadata & QC parameter configuration
+
+MIN_FEATURES     <- 200    
+MAX_FEATURES     <- 6000   
+MAX_MITO_PERCENT <- 8.0    
+
+normal_files <- c(
+  "GSM5573466_sample1_Normal.csv", "GSM5573469_sample4_Normal.csv",
+  "GSM5573471_sample6_Normal.csv", "GSM5573474_sample9_Normal.csv",
+  "GSM5573476_sample11_Normal.csv", "GSM5573486_sample21_Normal.csv",
+  "GSM5573488_sample23_Normal.csv", "GSM5573490_sample25_Normal.csv",
+  "GSM5573496_sample31_Normal.csv", "GSM5573500_sample35_Normal.csv"
+)
+
+tumor_files <- c(
+  "GSM5573467_sample2_Tumor.csv", "GSM5573468_sample3_Tumor.csv",
+  "GSM5573472_sample7_Tumor.csv", "GSM5573473_sample8_Tumor.csv",
+  "GSM5573475_sample10_Tumor.csv", "GSM5573477_sample12_Tumor.csv",
+  "GSM5573478_sample13_Tumor.csv", "GSM5573479_sample14_Tumor.csv",
+  "GSM5573480_sample15_Tumor.csv", "GSM5573481_sample16_Tumor.csv",
+  "GSM5573482_sample17_Tumor.csv", "GSM5573483_sample18_Tumor.csv",
+  "GSM5573487_sample22_Tumor.csv", "GSM5573489_sample24_Tumor.csv",
+  "GSM5573491_sample26_Tumor.csv", "GSM5573492_sample27_Tumor.csv",
+  "GSM5573493_sample28_Tumor.csv", "GSM5573494_sample29_Tumor.csv",
+  "GSM5573495_sample30_Tumor.csv", "GSM5573497_sample32_Tumor.csv",
+  "GSM5573498_sample33_Tumor.csv", "GSM5573499_sample34_Tumor.csv",
+  "GSM5573501_sample36_Tumor.csv", "GSM5573504_sample39_Tumor.csv",
+  "GSM5573505_sample40_Tumor.csv"
+)
+
+
+# MODULAR QC AND DATA LOADING
+
+process_sample_qc <- function(file_name, data_dir, sample_group) {
+  full_path <- file.path(data_dir, file_name)
+  sample_id <- gsub("\\.csv(\\.gz)?$", "", file_name)
+  
+  message(sprintf("Processing Sample: %s [%s]", sample_id, sample_group))
+  
+  if (!file.exists(full_path)) {
+    warning(sprintf("File missing: %s. Skipping sample.", full_path))
+    return(NULL)
+  }
+  
+  tryCatch({
+# Read count matrix
+    counts <- read.csv(file = full_path, row.names = 1, check.names = FALSE)
+    sparse_counts <- as(as.matrix(counts), "sparseMatrix")
+    
+# Initialize Seurat object
+    seurat_obj <- CreateSeuratObject(counts = sparse_counts, project = sample_id, min.cells = 3)
+    
+# Metadata & QC Metrics
+    seurat_obj[["percent.mt"]] <- PercentageFeatureSet(seurat_obj, pattern = "^MT-")
+    seurat_obj$group <- sample_group
+    seurat_obj$sample_id <- sample_id
+    
+# Filter cells using predefined thresholds
+    cells_before <- ncol(seurat_obj)
+    seurat_obj <- subset(
+      x = seurat_obj,
+      subset = nFeature_RNA >= MIN_FEATURES & 
+               nFeature_RNA <= MAX_FEATURES & 
+               percent.mt <= MAX_MITO_PERCENT
+    )
+    cells_after <- ncol(seurat_obj)
+    
+    message(sprintf("   Retained %d / %d cells (%.2f%%)", 
+                    cells_after, cells_before, (cells_after / cells_before) * 100))
+    
+    return(seurat_obj)
+  }, error = function(e) {
+    message(sprintf("Failed to process %s: %s", sample_id, e$message))
+    return(NULL)
+  })
+}
+
+# Load and quality-filter Normal and Tumor cohorts
+normal_list <- compact(lapply(normal_files, process_sample_qc, data_dir = DATA_DIR, sample_group = "Normal"))
+tumor_list  <- compact(lapply(tumor_files,  process_sample_qc, data_dir = DATA_DIR, sample_group = "Tumor"))
+
+if (length(normal_list) == 0 || length(tumor_list) == 0) {
+  stop("Critical Error: Pipeline halted due to missing input files.")
+}
+
+# Merge sample lists into group objects
+normal_object <- merge(x = normal_list[[1]], y = normal_list[-1], add.cell.ids = names(normal_list))
+tumor_object  <- merge(x = tumor_list[[1]],  y = tumor_list[-1],  add.cell.ids = names(tumor_list))
+
+# Save group RDS files
+saveRDS(normal_object, file.path(OUTPUT_DIR, "normal_object_qc.rds"))
+saveRDS(tumor_object,  file.path(OUTPUT_DIR, "tumor_object_qc.rds"))
+
+
+# HARMONY INTEGRATION & SCTRANSFORM
+message("--- Merging Cohorts for Integration ---")
+combined_object <- merge(
+  x = normal_object,
+  y = tumor_object,
+  add.cell.ids = c("N", "T"),
+  project = "ScRNA_Harmony_Study"
+)
+
+# Join raw count layers prior to normalization
+combined_object <- JoinLayers(combined_object, assay = "RNA")
+
+message("--- Running SCTransform Normalization ---")
+combined_object <- SCTransform(
+  object = combined_object,
+  assay = "RNA",
+  vst.flavor = "v2",
+  conserve.memory = TRUE,
+  verbose = FALSE
+)
+
+# Dimensionality reduction
+combined_object <- RunPCA(combined_object, assay = "SCT", npcs = 50, verbose = FALSE)
+
+message("--- Running Harmony Batch Correction ---")
+combined_object <- RunHarmony(
+  object = combined_object,
+  group.by.vars = "sample_id",
+  reduction.use = "pca",
+  dims.use = 1:30,
+  assay.compute = "SCT",
+  verbose = FALSE
+)
+
+# Clustering & UMAP Visualization
+
+combined_object <- FindNeighbors(combined_object, reduction = "harmony", dims = 1:30)
+combined_object <- FindClusters(combined_object, resolution = 0.3)
+combined_object <- RunUMAP(combined_object, reduction = "harmony", dims = 1:30)
+
+# Global Cluster UMAP Plot
+umap_clusters <- DimPlot(
+  combined_object, 
+  reduction = "umap", 
+  group.by = "seurat_clusters", 
+  label = TRUE, 
+  repel = TRUE, 
+  pt.size = 0.3
+) + ggtitle("Integrated UMAP (Harmony Corrected)") + 
+    theme_bw() + 
+    theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+
+# Side-by-Side Normal vs. Tumor Comparison Plot
+umap_split <- DimPlot(
+  combined_object, 
+  reduction = "umap", 
+  group.by = "seurat_clusters", 
+  split.by = "group",
+  label = TRUE, 
+  repel = TRUE, 
+  pt.size = 0.3
+) + ggtitle("Integrated UMAP: Normal vs. Tumor") + 
+    theme_bw() + 
+    theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+
+# Save Plots & Final Integrated Object
+ggsave(file.path(OUTPUT_DIR, "UMAP_Clusters_Global.png"), plot = umap_clusters, width = 8, height = 7, dpi = 300)
+ggsave(file.path(OUTPUT_DIR, "UMAP_Clusters_Split.png"),  plot = umap_split,    width = 14, height = 6, dpi = 300)
+
+# Dotplot and Annotation:
+
+library(Seurat)
+library(dplyr)
+library(ggplot2)
+library(readr)
+
+# Ensure output directory exists
+if (!dir.exists("./results")) dir.create("./results", recursive = TRUE)
+
+# Load integrated object from step 1
+integrated_object_clean_resumed <- readRDS(file = "./results/harmony_integrated_final.rds")
+
+# Define Annotation Marker Genes
+annotation_markers <- c("LEF1", "SELL", "CCR7", "CD8A", "GZMH", "GZMM", "NKG7", "GZMK", "EOMES", "GNLY", "GZMB", "CCL5", "GZMA", "TRAC", "FOXP3",
+  "CTLA4", "TRAC", "KDM5D", "IFIT2", "CCL3", "IL2RA", "CCL5", "GZMK"
+)
+
+# Set the Identity to the final cluster numbers
+Idents(integrated_object_clean_resumed) <- integrated_object_clean_resumed$seurat_clusters
+cluster_cols_names <- sort(unique(as.character(Idents(integrated_object_clean_resumed))))
+
+# Calculate Average Expression
+avg_expression_matrix <- Seurat::AverageExpression(
+  integrated_object_clean_resumed,
+  features = annotation_markers,
+  assays = "SCT"
+)$SCT
+
+# Calculate Percentage of Cells Expressing
+pct_expressed_matrix <- apply(
+  X = GetAssayData(integrated_object_clean_resumed, assay = "SCT", layer = "data")[annotation_markers, ],
+  MARGIN = 1, FUN = function(x) {
+    tapply(X = x, INDEX = Idents(integrated_object_clean_resumed), FUN = function(y) {
+      sum(y > 0) / length(y)
+    })
+  }
+)
+
+# Convert to Tidy Format and Merge (Base R reshape)
+avg_df <- as.data.frame(avg_expression_matrix)
+avg_df$Gene <- rownames(avg_df)
+cluster_cols <- colnames(avg_df)[1:(ncol(avg_df) - 1)]
+
+pct_matrix_transposed <- t(pct_expressed_matrix)
+pct_df <- as.data.frame(pct_matrix_transposed)
+colnames(pct_df) <- cluster_cols
+pct_df$Gene <- rownames(pct_df)
+
+avg_long <- reshape(data = avg_df, direction = "long", varying = list(cluster_cols), v.names = "avg.exp", timevar = "Cluster", times = cluster_cols)
+pct_long <- reshape(data = pct_df, direction = "long", varying = list(cluster_cols), v.names = "pct.exp", timevar = "Cluster", times = cluster_cols)
+dotplot_data_export_final <- merge(avg_long[, c("Gene", "Cluster", "avg.exp")], pct_long[, c("Gene", "Cluster", "pct.exp")], by = c("Gene", "Cluster"))
+
+# EXPORT CSV
+output_path <- "./results/manual_dotplot_data_for_visualization.csv"
+write.csv(dotplot_data_export_final, file = output_path, row.names = FALSE)
+print(paste("The final FIXED Dot Plot data has been successfully exported to:", output_path))
+
+# Load the Exported Scaled Data
+dotplot_data_final <- readr::read_csv("./results/manual_dotplot_data_for_visualization.csv")
+
+# Define the precise order of genes for the X-axis
+final_gene_order <- c("CD2", "CD3E", "CD3D", "CCL5", "KLRD1",
+                      "GNLY", "GZMA", "NKG7", "PRF1", "GZMK", "IFNG", "GZMB", "CD19", "MS4A1",
+                      "CCR7", "CIITA", "CXCR2", "S100A8", "S100A9", "FCGR3B", "CD14",
+                      "CD163", "CD68", "C1QA", "FCER1G", "IL1B", "SPI1", "C1QC", "HLA-DRA",
+                      "CD80", "CD86", "HLA-DPA1", "LTB", "TCF4", "IL3RA", "PLD4", "PECAM1",
+                      "VWF", "ENG", "PLVAP", "COL6A1", "COL1A2", "DCN","PDPN","TPSAB1",
+                      "TPSB2", "KIT", "SLC18A2", "IGHG1", "IGHG4", "TNFRSF17", "JSRP1",
+                      "GPX2", "CLDN4", "KRT19", "CLDN7")
+
+# Define the precise order of clusters for the Y-axis
+custom_cluster_order <- c("g0", "g22", "g1", "g9", "g12", "g15",
+                          "g6", "g2", "g13", "g5", "g21", "g4", "g8", "g16", "g14", "g18", "g19",
+                          "g17", "g20", "g7", "g23", "g24", "g11", "g10", "g3", "g25")
+
+color_cap <- 10
+MIN_PCT_THRESHOLD <- 0.2
+
+# Data Preparation and Filtering (avg.exp <= 10)
+dotplot_data_final_filtered <- dotplot_data_final[
+  dotplot_data_final$avg.exp <= color_cap,
+]
+
+# Apply the filter for minimum percentage threshold (pct.exp >= 0.2)
+dotplot_data_final_filtered_size <- dotplot_data_final_filtered[
+  dotplot_data_final_filtered$pct.exp >= MIN_PCT_THRESHOLD,
+]
+
+# Set Factor Levels for Gene and Cluster
+dotplot_data_final_filtered_size$Gene <- factor(
+  dotplot_data_final_filtered_size$Gene,
+  levels = unique(final_gene_order)
+)
+dotplot_data_final_filtered_size$Cluster <- factor(
+  dotplot_data_final_filtered_size$Cluster,
+  levels = unique(custom_cluster_order)
+)
+
+# Generate the Final Dot Plot
+final_ggplot_dotplot_ordered <- ggplot(dotplot_data_final_filtered_size, aes(x = Gene, y = Cluster)) +
+  geom_point(aes(color = avg.exp, size = pct.exp)) +
+  scale_color_gradientn(
+    colors = c("blue", "red"),
+    limits = c(0, color_cap),
+    name = "Avg. Expression"
+  ) +
+  scale_size_continuous(
+    range = c(0, 8),
+    breaks = c(0.2, 0.4, 0.6, 0.8),
+    limits = c(MIN_PCT_THRESHOLD, max(dotplot_data_final_filtered_size$pct.exp)),
+    name = "Percent Expressed"
+  ) +
+  theme_bw() +
+  theme(
+    axis.text.x = element_text(angle = 90, hjust = 1, size = 8),
+    axis.title.y = element_blank(),
+    plot.title = element_text(hjust = 0.5)
+  ) +
+  labs(
+    x = "Gene Marker (Ordered by Annotation)",
+    y = "Cluster ID",
+    title = "Final Annotation Dot Plot (Standard Orientation)"
+  )
+
+# Display the plot
+print(final_ggplot_dotplot_ordered)
+ggsave("./results/Final_Annotation_DotPlot.png", plot = final_ggplot_dotplot_ordered, width = 12, height = 7, dpi = 300)
+
+#  Cluster annotation for Individual cell types
+# Ensure the cluster ID column is treated as character/factor for recoding
+integrated_object_clean_resumed@meta.data$seurat_clusters <-
+  as.character(integrated_object_clean_resumed@meta.data$seurat_clusters)
+
+integrated_object_clean_resumed@meta.data <- integrated_object_clean_resumed@meta.data %>%
+  mutate(
+    cell_type_annotation = case_when(
+      # T-Cell Subsets
+      seurat_clusters %in% c("0", "9") ~ "Effector and Memory CD8+ T cells",
+      seurat_clusters %in% c("12") ~ "Cytotoxic CD8+ T cells",
+      seurat_clusters %in% c("15", "22") ~ "Effector and Memory CD4+ T cells",
+      seurat_clusters %in% c("6") ~ "Naive CD4+ and CD8+ T cells",
+      seurat_clusters %in% c("1") ~ "T reg cells",
+      
+      # Specific other labels
+      seurat_clusters %in% c("2", "13") ~ "Myeloid cells",
+      seurat_clusters %in% c("5") ~ "APC cells",
+      seurat_clusters %in% c("21", "2", "8") ~ "Fibroblast cells",
+      seurat_clusters %in% c("16") ~ "Mast cells",
+      seurat_clusters %in% c("10", "3", "25") ~ "Epithelial cells",
+      seurat_clusters %in% c("11", "24", "23", "7", "20", "17", "19", "18", "14") ~ "Plasma cells",
+      
+      TRUE ~ "Other/Unknown"
+    )
+  )
+
+# Save the annotated object
+saveRDS(integrated_object_clean_resumed, file = "./results/harmony_integrated_object_annotated.rds")
+
+# Set Default Assay to SCT
+DefaultAssay(integrated_object_clean_resumed) <- "SCT"
+
+# Define target genes
+target_genes <- c("BTN3A3")
+
+# Define custom color gradient: Grey -> Yellow -> Red
+custom_colors <- c("grey", "yellow", "red")
+
+# Generate FeaturePlot
+plot_combined_features <- FeaturePlot(
+  object = integrated_object_clean_resumed,
+  features = target_genes,
+  reduction = "umap",
+  pt.size = 0.5,
+  order = TRUE,
+  ncol = 4,
+  cols = custom_colors
+)
+
+# Display plot
+print(plot_combined_features)
+ggsave("./results/FeaturePlot_BTN3A3.png", plot = plot_combined_features, width = 7, height = 6, dpi = 300)
+
+
+
+
